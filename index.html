@@ -1,0 +1,790 @@
+import React, { useState, useMemo, useEffect } from 'react';
+import { 
+  Calendar as CalendarIcon, 
+  List, 
+  Plus, 
+  Download, 
+  Edit, 
+  Trash2, 
+  User, 
+  Briefcase, 
+  CheckCircle,
+  Building,
+  ChevronLeft,
+  ChevronRight,
+  CheckSquare,
+  Image as ImageIcon,
+  Filter,
+  LayoutDashboard,
+  Loader2,
+  FileText
+} from 'lucide-react';
+
+// --- Configuration ---
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbz_4zyVFdpr4TTFK7tXiZ-YS1OA-FsrWu-nCH3IzvlfJdaDWnJ8bVhqg_g6rsY2ITvyaA/exec';
+
+const DEPARTMENTS = [
+  { id: 'dep1', name: 'งานสำนักงานบริหารกิจการนักเรียน', bg: 'bg-slate-700', text: 'text-white', border: 'border-slate-800' },
+  { id: 'dep2', name: 'งานระบบดูแลช่วยเหลือนักเรียน', bg: 'bg-blue-700', text: 'text-white', border: 'border-blue-800' },
+  { id: 'dep3', name: 'งานส่งเสริมคุณธรรม - จริยธรรม', bg: 'bg-amber-600', text: 'text-white', border: 'border-amber-700' },
+  { id: 'dep4', name: 'งานประชาธิปไตยฯ (สภานักเรียน)', bg: 'bg-orange-600', text: 'text-white', border: 'border-orange-700' },
+  { id: 'dep5', name: 'งานป้องกันและแก้ไขปัญหายาเสพติด', bg: 'bg-red-700', text: 'text-white', border: 'border-red-800' },
+  { id: 'dep6', name: 'งานนักศึกษาวิชาทหาร (รด.)', bg: 'bg-green-700', text: 'text-white', border: 'border-green-800' },
+  { id: 'dep7', name: 'งานส่งเสริมพฤติกรรมนักเรียน (พสน.)', bg: 'bg-purple-700', text: 'text-white', border: 'border-purple-800' },
+  { id: 'dep8', name: 'งานสารสนเทศกลุ่มบริหารงานกิจการนักเรียน', bg: 'bg-cyan-700', text: 'text-white', border: 'border-cyan-800' },
+  { id: 'dep9', name: 'งานรักษาความปลอดภัย', bg: 'bg-indigo-700', text: 'text-white', border: 'border-indigo-800' },
+];
+
+// --- Utility Functions ---
+const parseRobustDate = (dateVal) => {
+  if (!dateVal) return null;
+  let d = new Date(dateVal);
+  if (!isNaN(d.getTime())) return d;
+  
+  const parts = String(dateVal).trim().split(/[\/\-]/);
+  if (parts.length === 3) {
+    if (parts[2].length >= 4) {
+       let y = parseInt(parts[2], 10);
+       if (y > 2400) y -= 543;
+       d = new Date(y, parseInt(parts[1], 10) - 1, parseInt(parts[0], 10));
+       if (!isNaN(d.getTime())) return d;
+    }
+  }
+  return null;
+};
+
+const formatYMD = (d) => {
+  if (!d) return '';
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+};
+
+const exportToCSV = (tasks, filename = 'tasks.csv') => {
+  const headers = ['ชื่อกิจกรรม/งาน', 'รายละเอียด', 'ฝ่าย', 'วันที่เริ่ม', 'วันที่สิ้นสุด', 'ผู้รับผิดชอบ', 'ชื่อโครงการ', 'งบประมาณ', 'หน่วยงานที่ประสาน', 'สถานะ', 'ลิงก์ผลงาน'];
+  const csvContent = [
+    headers.join(','),
+    ...tasks.map(t => {
+      const deptName = DEPARTMENTS.find(d => d.id === t.departmentId)?.name || '';
+      const statusText = t.status === 'completed' ? 'เสร็จสิ้น' : (t.status === 'in-progress' ? 'กำลังดำเนินการ' : 'รอดำเนินการ');
+      const safeDesc = (t.description || '').replace(/"/g, '""'); // Escape double quotes for CSV
+      return `"${t.title || ''}","${safeDesc}","${deptName}","${t.date || ''}","${t.endDate || ''}","${t.assignee || ''}","${t.project || ''}","${t.budget || ''}","${t.coordinators || ''}","${statusText}","${t.imageUrl || ''}"`;
+    })
+  ].join('\n');
+
+  const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' }); 
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.setAttribute('download', filename);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+};
+
+export default function App() {
+  const [tasks, setTasks] = useState([]);
+  
+  // Loading & Dialog States
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [dialog, setDialog] = useState({ isOpen: false, type: 'alert', message: '', onConfirm: null });
+
+  // Navigation State
+  const [currentView, setCurrentView] = useState('active');
+  const [selectedDeptId, setSelectedDeptId] = useState('all');
+  
+  // Calendar State 
+  const [currentMonth, setCurrentMonth] = useState(() => new Date());
+  const [completedMonthFilter, setCompletedMonthFilter] = useState('all');
+
+  // Modal State
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState(null);
+  const [formData, setFormData] = useState({
+    title: '', description: '', departmentId: 'dep1', date: '', endDate: '', assignee: '', project: '', budget: '', coordinators: '', status: 'pending', imageUrl: ''
+  });
+
+  // --- Dialog Helpers ---
+  const showAlert = (message) => setDialog({ isOpen: true, type: 'alert', message, onConfirm: null });
+  const showConfirm = (message, onConfirm) => setDialog({ isOpen: true, type: 'confirm', message, onConfirm });
+  const closeDialog = () => setDialog({ isOpen: false, type: 'alert', message: '', onConfirm: null });
+
+  useEffect(() => {
+    fetchTasks();
+  }, []);
+
+  const fetchTasks = async () => {
+    setIsLoading(true);
+    try {
+      const response = await fetch(SCRIPT_URL);
+      const data = await response.json();
+      setTasks(data);
+    } catch (error) {
+      console.error('Error fetching data:', error);
+      showAlert('ไม่สามารถเชื่อมต่อกับ Google Sheets ได้ กรุณารีเฟรชหน้าเว็บ');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleOpenModal = (task = null) => {
+    if (task) {
+      setEditingTask(task);
+      // Format dates to YYYY-MM-DD for the date input fields
+      const formattedDate = task.date ? formatYMD(parseRobustDate(task.date)) : '';
+      const formattedEndDate = task.endDate ? formatYMD(parseRobustDate(task.endDate)) : '';
+      
+      setFormData({ 
+        ...task,
+        date: formattedDate,
+        endDate: formattedEndDate
+      });
+    } else {
+      setEditingTask(null);
+      const today = new Date().toISOString().split('T')[0];
+      setFormData({
+        title: '', 
+        description: '',
+        departmentId: selectedDeptId !== 'all' ? selectedDeptId : 'dep1', 
+        date: today, 
+        endDate: today, 
+        assignee: '', project: '', budget: '', coordinators: '', status: 'pending', imageUrl: ''
+      });
+    }
+    setIsModalOpen(true);
+  };
+
+  const handleCloseModal = () => {
+    setIsModalOpen(false);
+    setEditingTask(null);
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setIsSaving(true);
+
+    const action = editingTask ? 'update' : 'add';
+    const taskData = editingTask
+      ? { ...formData, id: editingTask.id }
+      : { ...formData, id: Date.now().toString() };
+
+    try {
+      await fetch(SCRIPT_URL, {
+        method: 'POST',
+        body: JSON.stringify({ action: action, task: taskData }),
+        headers: {
+          'Content-Type': 'text/plain;charset=utf-8',
+        },
+      });
+      
+      if (editingTask) {
+        setTasks(tasks.map(t => String(t.id) === String(editingTask.id) ? taskData : t));
+      } else {
+        setTasks([...tasks, taskData]);
+      }
+      
+      handleCloseModal();
+    } catch (error) {
+      console.error('Error saving data:', error);
+      showAlert('เกิดข้อผิดพลาดในการบันทึกข้อมูลลง Google Sheets');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleDelete = (id) => {
+    showConfirm('คุณต้องการลบข้อมูลนี้ใช่หรือไม่? การลบนี้จะถูกนำออกจากระบบอย่างถาวร', async () => {
+      const previousTasks = [...tasks];
+      setTasks(tasks.filter(t => String(t.id) !== String(id))); 
+
+      try {
+        await fetch(SCRIPT_URL, {
+          method: 'POST',
+          body: JSON.stringify({ action: 'delete', task: { id: id } }),
+          headers: {
+            'Content-Type': 'text/plain;charset=utf-8',
+          },
+        });
+      } catch (error) {
+        console.error('Error deleting data:', error);
+        setTasks(previousTasks); 
+        showAlert('เกิดข้อผิดพลาดในการลบข้อมูลจาก Google Sheets');
+      }
+    });
+  };
+
+  const handleMarkComplete = (task) => {
+    handleOpenModal({ ...task, status: 'completed' });
+  };
+
+  const handlePrevMonth = () => setCurrentMonth(prev => new Date(prev.getFullYear(), prev.getMonth() - 1, 1));
+  const handleNextMonth = () => setCurrentMonth(prev => new Date(prev.getFullYear(), prev.getMonth() + 1, 1));
+
+  const activeTasks = useMemo(() => tasks.filter(t => t.status !== 'completed'), [tasks]);
+  const completedTasks = useMemo(() => tasks.filter(t => t.status === 'completed'), [tasks]);
+
+  const filteredActiveTasks = useMemo(() => {
+    let filtered = activeTasks;
+    if (selectedDeptId !== 'all') filtered = filtered.filter(t => t.departmentId === selectedDeptId);
+    filtered = filtered.filter(t => {
+      const dStart = parseRobustDate(t.date);
+      if (!dStart) return true; 
+      
+      const dEnd = t.endDate ? parseRobustDate(t.endDate) : dStart;
+
+      const targetMonthStart = new Date(currentMonth.getFullYear(), currentMonth.getMonth(), 1);
+      const targetMonthEnd = new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1, 0, 23, 59, 59);
+      
+      return (dStart <= targetMonthEnd && (dEnd || dStart) >= targetMonthStart);
+    });
+    return filtered.sort((a, b) => (parseRobustDate(a.date) || 0) - (parseRobustDate(b.date) || 0));
+  }, [activeTasks, selectedDeptId, currentMonth]);
+
+  const filteredCompletedTasks = useMemo(() => {
+    let filtered = completedTasks;
+    if (selectedDeptId !== 'all') filtered = filtered.filter(t => t.departmentId === selectedDeptId);
+    if (completedMonthFilter !== 'all') {
+       filtered = filtered.filter(t => {
+          const taskDate = new Date(t.date);
+          const taskMonthYear = `${taskDate.getFullYear()}-${taskDate.getMonth()}`;
+          return taskMonthYear === completedMonthFilter;
+       });
+    }
+    return filtered.sort((a, b) => new Date(b.date) - new Date(a.date));
+  }, [completedTasks, selectedDeptId, completedMonthFilter]);
+
+  const filteredCalendarTasks = useMemo(() => {
+    let filtered = tasks;
+    if (selectedDeptId !== 'all') filtered = filtered.filter(t => t.departmentId === selectedDeptId);
+    filtered = filtered.filter(t => {
+      const dStart = parseRobustDate(t.date);
+      if (!dStart) return true; 
+      
+      const dEnd = t.endDate ? parseRobustDate(t.endDate) : dStart;
+
+      const targetMonthStart = new Date(currentMonth.getFullYear(), currentMonth.getMonth(), 1);
+      const targetMonthEnd = new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1, 0, 23, 59, 59);
+      
+      return (dStart <= targetMonthEnd && (dEnd || dStart) >= targetMonthStart);
+    });
+    return filtered.sort((a, b) => (parseRobustDate(a.date) || 0) - (parseRobustDate(b.date) || 0));
+  }, [tasks, selectedDeptId, currentMonth]);
+
+  const completedMonthsOptions = useMemo(() => {
+    const months = new Set();
+    completedTasks.forEach(t => {
+      if (t.date) {
+        const d = new Date(t.date);
+        months.add(`${d.getFullYear()}-${d.getMonth()}`);
+      }
+    });
+    return Array.from(months).sort().map(mStr => {
+      const [year, month] = mStr.split('-');
+      const date = new Date(parseInt(year), parseInt(month), 1);
+      return {
+        value: mStr,
+        label: `${['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน', 'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'][date.getMonth()]} ${date.getFullYear() + 543}`
+      };
+    }).reverse();
+  }, [completedTasks]);
+
+  if (isLoading) {
+    return (
+      <div className="flex flex-col h-screen w-full items-center justify-center bg-slate-50">
+        <Loader2 className="w-10 h-10 text-blue-600 animate-spin mb-4" />
+        <h2 className="text-lg font-semibold text-slate-700">กำลังเชื่อมต่อฐานข้อมูล...</h2>
+        <p className="text-sm text-slate-500 mt-1">โปรดรอสักครู่</p>
+      </div>
+    );
+  }
+
+  const renderSidebar = () => (
+    <div className="w-64 bg-[#0F172A] text-slate-300 min-h-screen flex flex-col z-20 border-r border-slate-800">
+      <div className="flex items-center space-x-3 p-5 border-b border-slate-800/80 bg-[#0B1121]">
+        <Building className="w-7 h-7 text-blue-500" />
+        <div>
+          <h1 className="font-semibold text-base text-white leading-tight">ระบบจัดการงาน</h1>
+          <p className="text-[11px] text-slate-400 mt-0.5 uppercase tracking-wide">กิจการนักเรียน</p>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto py-5">
+        <div className="px-3 mb-6 space-y-1">
+          <div className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-2 px-3">มุมมองหลัก (Main Views)</div>
+          <button 
+            onClick={() => setCurrentView('active')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-md transition-colors ${currentView === 'active' ? 'bg-blue-600/10 text-blue-400 border-l-2 border-blue-500' : 'hover:bg-slate-800 border-l-2 border-transparent'}`}
+          >
+            <div className="flex items-center space-x-3">
+              <CalendarIcon className="w-4 h-4" />
+              <span className="font-medium text-sm">ปฏิทินงานปัจจุบัน</span>
+            </div>
+            {activeTasks.length > 0 && <span className="bg-blue-900/50 text-blue-300 px-2 py-0.5 rounded text-xs font-semibold">{activeTasks.length}</span>}
+          </button>
+          
+          <button 
+            onClick={() => setCurrentView('completed')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-md transition-colors ${currentView === 'completed' ? 'bg-emerald-600/10 text-emerald-400 border-l-2 border-emerald-500' : 'hover:bg-slate-800 border-l-2 border-transparent'}`}
+          >
+            <div className="flex items-center space-x-3">
+              <CheckSquare className="w-4 h-4" />
+              <span className="font-medium text-sm">สรุปงานที่เสร็จสิ้น</span>
+            </div>
+          </button>
+        </div>
+
+        <div className="px-3 space-y-1">
+          <div className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-2 px-3">กรองตามฝ่ายงาน (Departments)</div>
+          <button
+            onClick={() => setSelectedDeptId('all')}
+            className={`w-full flex items-center space-x-3 px-3 py-2 rounded-md text-sm transition-colors ${selectedDeptId === 'all' ? 'bg-slate-800 text-white' : 'text-slate-400 hover:bg-slate-800 hover:text-white'}`}
+          >
+            <LayoutDashboard className="w-4 h-4 text-slate-500" />
+            <span className="font-medium">ดูทุกฝ่ายงาน</span>
+          </button>
+          
+          <div className="h-1"></div>
+          
+          {DEPARTMENTS.map(dept => (
+            <button
+              key={dept.id}
+              onClick={() => setSelectedDeptId(dept.id)}
+              className={`w-full flex items-center space-x-3 px-3 py-1.5 rounded-md text-[13px] transition-colors ${selectedDeptId === dept.id ? 'bg-slate-800 text-white' : 'text-slate-400 hover:bg-slate-800 hover:text-white'}`}
+            >
+              <div className={`w-2 h-2 rounded-full ${dept.bg}`}></div>
+              <span className="truncate text-left">{dept.name.replace('งาน', '')}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="p-4 border-t border-slate-800 bg-[#0B1121]">
+        <button onClick={() => handleOpenModal()} className="w-full flex items-center justify-center space-x-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2.5 rounded-md text-sm font-medium transition-colors">
+          <Plus className="w-4 h-4" />
+          <span>เพิ่มงาน / โครงการ</span>
+        </button>
+      </div>
+    </div>
+  );
+
+  const renderMiniCalendar = () => {
+    const year = currentMonth.getFullYear();
+    const month = currentMonth.getMonth();
+    const firstDay = new Date(year, month, 1);
+    const lastDay = new Date(year, month + 1, 0);
+    const daysInMonth = lastDay.getDate();
+    const startingDay = firstDay.getDay();
+    
+    const days = [];
+    for (let i = 0; i < startingDay; i++) days.push(null);
+    for (let i = 1; i <= daysInMonth; i++) days.push(new Date(year, month, i));
+    const monthNames = ['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน', 'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'];
+
+    const todayStr = formatYMD(new Date());
+
+    return (
+      <div className="bg-white rounded-lg shadow-sm border border-slate-200 p-5 flex flex-col">
+        <div className="flex justify-between items-center mb-4">
+          <h2 className="text-base font-semibold text-slate-800 flex items-center">
+            <CalendarIcon className="w-4 h-4 mr-2 text-slate-500" />
+            ปฏิทินปฏิบัติงาน
+            {selectedDeptId !== 'all' && (
+              <span className="ml-3 text-xs font-medium text-blue-700 bg-blue-50 border border-blue-100 px-2 py-0.5 rounded-md">
+                {DEPARTMENTS.find(d => d.id === selectedDeptId)?.name}
+              </span>
+            )}
+          </h2>
+          <div className="flex items-center space-x-2 bg-slate-50 p-1 rounded-md border border-slate-200">
+            <button onClick={handlePrevMonth} className="p-1 hover:bg-white rounded text-slate-600 transition-colors"><ChevronLeft className="w-4 h-4" /></button>
+            <span className="text-sm font-semibold text-slate-700 w-28 text-center">{monthNames[month]} {year + 543}</span>
+            <button onClick={handleNextMonth} className="p-1 hover:bg-white rounded text-slate-600 transition-colors"><ChevronRight className="w-4 h-4" /></button>
+          </div>
+        </div>
+        
+        <div className="grid grid-cols-7 gap-px bg-slate-200 border border-slate-200 rounded-md overflow-hidden flex-1 min-h-[300px]">
+          {['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์'].map((d, i) => (
+            <div key={d} className={`bg-slate-50 text-[11px] font-semibold text-slate-500 py-2.5 text-center uppercase tracking-wide ${i === 0 || i === 6 ? 'text-rose-500' : ''}`}>
+              {d}
+            </div>
+          ))}
+          {days.map((date, idx) => {
+            if (!date) return <div key={`empty-${idx}`} className="bg-slate-50/50 min-h-[90px]"></div>;
+            
+            const dateStr = formatYMD(date);
+            
+            const dayTasks = filteredCalendarTasks.filter(t => {
+              const dStart = parseRobustDate(t.date);
+              if (!dStart) return false; 
+              
+              const dEnd = t.endDate ? parseRobustDate(t.endDate) : dStart;
+              
+              const tStartStr = formatYMD(dStart);
+              const tEndStr = formatYMD(dEnd || dStart);
+              
+              return tStartStr <= dateStr && tEndStr >= dateStr;
+            });
+            
+            const isToday = dateStr === todayStr;
+
+            return (
+              <div key={idx} className={`bg-white min-h-[90px] p-1.5 flex flex-col relative transition-colors hover:bg-slate-50 group`}>
+                <div className={`text-xs font-semibold text-right mb-1.5 ${isToday ? 'text-white bg-blue-600 w-5 h-5 rounded-full flex items-center justify-center ml-auto' : 'text-slate-600'}`}>
+                  {date.getDate()}
+                </div>
+                <div className="flex-1 flex flex-col gap-1 overflow-y-auto">
+                  {dayTasks.map((t, i) => {
+                    const dept = DEPARTMENTS.find(d => d.id === t.departmentId);
+                    const isCompleted = t.status === 'completed';
+                    const bgClass = isCompleted ? 'bg-slate-100' : (dept?.bg || 'bg-slate-200');
+                    const textClass = isCompleted ? 'text-slate-500 line-through' : 'text-white';
+                    
+                    return (
+                      <div 
+                        key={i} 
+                        onClick={() => handleOpenModal(t)}
+                        className={`text-[10px] px-1.5 py-0.5 rounded-sm cursor-pointer truncate transition-opacity hover:opacity-80 ${bgClass} ${textClass}`} 
+                        title={t.title}
+                      >
+                        {t.title}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  const renderTaskTable = (isCompletedView = false) => {
+    const dataToDisplay = isCompletedView ? filteredCompletedTasks : filteredActiveTasks;
+
+    return (
+      <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden flex flex-col h-full">
+        <div className="px-5 py-3 border-b border-slate-200 flex flex-wrap justify-between items-center bg-white gap-4">
+          <h2 className="text-base font-semibold text-slate-800 flex items-center">
+            {isCompletedView ? <CheckSquare className="w-4 h-4 mr-2 text-emerald-600" /> : <List className="w-4 h-4 mr-2 text-blue-600" />}
+            {isCompletedView ? 'รายการงานที่เสร็จสิ้น' : 'รายการงานที่กำลังดำเนินการ'} 
+            <span className="ml-2 bg-slate-100 text-slate-600 py-0.5 px-2 rounded-full text-xs">{dataToDisplay.length} รายการ</span>
+          </h2>
+          
+          <div className="flex items-center space-x-2">
+             <div className="flex items-center bg-slate-50 px-2 py-1 rounded-md border border-slate-200">
+               <Filter className="w-3 h-3 mr-2 text-slate-400" />
+               <select 
+                 value={selectedDeptId} 
+                 onChange={(e) => setSelectedDeptId(e.target.value)}
+                 className="py-0.5 text-xs font-medium text-slate-700 bg-transparent focus:outline-none focus:ring-0 border-none cursor-pointer"
+               >
+                 <option value="all">ทุกฝ่ายงาน</option>
+                 {DEPARTMENTS.map(d => (
+                   <option key={d.id} value={d.id}>{d.name}</option>
+                 ))}
+               </select>
+             </div>
+
+            {isCompletedView && (
+              <div className="flex items-center bg-slate-50 px-2 py-1 rounded-md border border-slate-200">
+                <CalendarIcon className="w-3 h-3 mr-2 text-slate-400" />
+                <select 
+                  value={completedMonthFilter} 
+                  onChange={(e) => setCompletedMonthFilter(e.target.value)}
+                  className="py-0.5 text-xs font-medium text-slate-700 bg-transparent focus:outline-none focus:ring-0 border-none cursor-pointer"
+                >
+                  <option value="all">ทุกเดือน</option>
+                  {completedMonthsOptions.map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            <button 
+              onClick={() => exportToCSV(dataToDisplay, isCompletedView ? 'completed_tasks.csv' : 'active_tasks.csv')}
+              className="flex items-center space-x-1 px-3 py-1 bg-white text-slate-700 border border-slate-300 hover:bg-slate-50 rounded-md text-xs font-medium transition-colors shadow-sm"
+            >
+              <Download className="w-3 h-3" />
+              <span>ส่งออก CSV</span>
+            </button>
+          </div>
+        </div>
+        <div className="overflow-x-auto flex-1">
+          <table className="w-full text-left border-collapse">
+            <thead>
+              <tr className="bg-slate-50 border-b border-slate-200 text-[11px] text-slate-500 uppercase tracking-wider">
+                <th className="px-5 py-3 font-semibold w-28">วันที่</th>
+                <th className="px-5 py-3 font-semibold">ชื่องาน / ฝ่าย</th>
+                <th className="px-5 py-3 font-semibold hidden md:table-cell w-1/4">รายละเอียด</th>
+                <th className="px-5 py-3 font-semibold hidden lg:table-cell">โครงการ & งบฯ</th>
+                <th className="px-5 py-3 font-semibold text-center">สถานะ</th>
+                <th className="px-5 py-3 font-semibold text-right">จัดการ</th>
+              </tr>
+            </thead>
+            <tbody className="bg-white divide-y divide-slate-100">
+              {dataToDisplay.length === 0 ? (
+                <tr>
+                  <td colSpan="6" className="px-5 py-12 text-center text-slate-400">
+                    <div className="flex flex-col items-center">
+                      <FileText className="w-10 h-10 mb-3 text-slate-200" />
+                      <p className="text-sm font-medium text-slate-500">
+                        {isCompletedView ? 'ไม่มีรายการที่เสร็จสิ้น' : 'ไม่มีรายการงานในขณะนี้'}
+                      </p>
+                    </div>
+                  </td>
+                </tr>
+              ) : dataToDisplay.map((task) => {
+                const dept = DEPARTMENTS.find(d => d.id === task.departmentId);
+                
+                const safeFormatDate = (dateVal) => {
+                  const d = parseRobustDate(dateVal);
+                  if (!d) return dateVal || '-';
+                  return `${d.getDate()} ${['ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.', 'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.'][d.getMonth()]}`;
+                };
+                
+                const startDateStr = safeFormatDate(task.date);
+                const endDateStr = safeFormatDate(task.endDate);
+                
+                const isSameDate = task.date === task.endDate || startDateStr === endDateStr;
+                const displayTitle = task.title || 'ไม่มีข้อมูลชื่องาน';
+
+                return (
+                  <tr key={task.id} className="hover:bg-slate-50/80 transition-colors group">
+                    <td className="px-5 py-3 align-top whitespace-nowrap">
+                      <div className="text-[13px] font-medium text-slate-700">{startDateStr}</div>
+                      {!isSameDate && <div className="text-[11px] text-slate-400 mt-0.5">ถึง {endDateStr}</div>}
+                    </td>
+                    <td className="px-5 py-3 align-top">
+                      <div className={`text-sm font-medium mb-1.5 ${isCompletedView ? 'line-through text-slate-500' : 'text-slate-900'} ${!task.title && 'text-red-500'}`}>{displayTitle}</div>
+                      <div className="flex flex-wrap gap-2 items-center">
+                        <div className="inline-flex items-center text-[10px] font-medium text-slate-600 bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded">
+                          {dept?.name || 'ไม่ระบุฝ่าย'}
+                        </div>
+                        {isCompletedView && task.imageUrl && (
+                          <a href={task.imageUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100 transition-colors" title="ดูรูปภาพผลงาน">
+                            <ImageIcon className="w-3 h-3 mr-1" /> แนบไฟล์แล้ว
+                          </a>
+                        )}
+                      </div>
+                    </td>
+                    <td className="px-5 py-3 align-top hidden md:table-cell">
+                      <div className={`text-xs ${isCompletedView ? 'text-slate-400' : 'text-slate-600'} line-clamp-2 leading-relaxed`}>
+                        {task.description || '-'}
+                      </div>
+                    </td>
+                    <td className="px-5 py-3 align-top hidden lg:table-cell">
+                      <div className="text-xs text-slate-700 flex items-start mb-1">
+                        <Briefcase className="w-3 h-3 mr-1.5 text-slate-400 mt-0.5 flex-shrink-0" />
+                        <span className="line-clamp-1">{task.project || '-'}</span>
+                      </div>
+                      <div className="text-[11px] text-slate-500 flex items-center mt-1">
+                         <User className="w-3 h-3 mr-1.5 text-slate-400" />
+                         {task.assignee || 'ไม่ระบุ'}
+                      </div>
+                    </td>
+                    <td className="px-5 py-3 align-top text-center">
+                      <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium border
+                        ${task.status === 'completed' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 
+                          task.status === 'in-progress' ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-slate-50 text-slate-600 border-slate-200'}`}
+                      >
+                        {task.status === 'completed' ? 'เสร็จสิ้น' : task.status === 'in-progress' ? 'กำลังดำเนินการ' : 'รอดำเนินการ'}
+                      </span>
+                    </td>
+                    <td className="px-5 py-3 align-top text-right space-x-1 whitespace-nowrap">
+                      {!isCompletedView && (
+                        <button 
+                          onClick={() => handleMarkComplete(task)} 
+                          className="p-1.5 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded transition-colors"
+                          title="บันทึกว่าเสร็จสิ้น"
+                        >
+                          <CheckCircle className="w-4 h-4" />
+                        </button>
+                      )}
+                      <button onClick={() => handleOpenModal(task)} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors" title="แก้ไข">
+                        <Edit className="w-4 h-4" />
+                      </button>
+                      <button onClick={() => handleDelete(task.id)} className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors" title="ลบ">
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  };
+
+  const renderTaskModal = () => {
+    if (!isModalOpen) return null;
+
+    return (
+      <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4 z-50 overflow-y-auto">
+        <div className="bg-white rounded-lg w-full max-w-2xl shadow-xl overflow-hidden my-8 border border-slate-200">
+          <div className="bg-slate-50 px-6 py-4 flex justify-between items-center border-b border-slate-200">
+            <h3 className="font-semibold text-lg text-slate-800 flex items-center">
+              {editingTask ? <Edit className="w-4 h-4 mr-2 text-slate-500" /> : <Plus className="w-4 h-4 mr-2 text-slate-500" />}
+              {editingTask ? 'แก้ไขรายละเอียดงาน' : 'แบบฟอร์มเพิ่มงานใหม่'}
+            </h3>
+            <button onClick={handleCloseModal} className="text-slate-400 hover:text-slate-600 transition-colors">&times;</button>
+          </div>
+          
+          <form onSubmit={handleSubmit} className="p-6 space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-x-5 gap-y-4">
+              <div className="md:col-span-2">
+                <label className="block text-[13px] font-medium text-slate-700 mb-1">ชื่องาน / กิจกรรม <span className="text-red-500">*</span></label>
+                <input required type="text" value={formData.title} onChange={e => setFormData({...formData, title: e.target.value})} className="w-full px-3 py-2 border border-slate-300 rounded-md shadow-sm focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all text-sm text-slate-900" placeholder="ระบุชื่องานที่ชัดเจน..." />
+              </div>
+
+              <div className="md:col-span-2">
+                <label className="block text-[13px] font-medium text-slate-700 mb-1">รายละเอียดของงาน</label>
+                <textarea 
+                  rows="3" 
+                  value={formData.description || ''} 
+                  onChange={e => setFormData({...formData, description: e.target.value})} 
+                  className="w-full px-3 py-2 border border-slate-300 rounded-md shadow-sm focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all text-sm text-slate-900 resize-none" 
+                  placeholder="อธิบายรายละเอียดของงานหรือกิจกรรมเพิ่มเติม..." 
+                />
+              </div>
+
+              <div className="md:col-span-2">
+                <label className="block text-[13px] font-medium text-slate-700 mb-1">ฝ่ายรับผิดชอบหลัก <span className="text-red-500">*</span></label>
+                <select required value={formData.departmentId} onChange={e => setFormData({...formData, departmentId: e.target.value})} className="w-full px-3 py-2 border border-slate-300 rounded-md shadow-sm focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none bg-white text-sm text-slate-900">
+                  {DEPARTMENTS.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-[13px] font-medium text-slate-700 mb-1">วันที่เริ่มต้น <span className="text-red-500">*</span></label>
+                <input required type="date" value={formData.date} onChange={e => setFormData({...formData, date: e.target.value})} className="w-full px-3 py-2 border border-slate-300 rounded-md shadow-sm focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none text-sm text-slate-900" />
+              </div>
+              
+              <div>
+                <label className="block text-[13px] font-medium text-slate-700 mb-1">วันที่สิ้นสุด <span className="text-red-500">*</span></label>
+                <input required type="date" value={formData.endDate} onChange={e => setFormData({...formData, endDate: e.target.value})} className="w-full px-3 py-2 border border-slate-300 rounded-md shadow-sm focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none text-sm text-slate-900" />
+              </div>
+
+              <div>
+                <label className="block text-[13px] font-medium text-slate-700 mb-1">ผู้รับผิดชอบ</label>
+                <input type="text" value={formData.assignee} onChange={e => setFormData({...formData, assignee: e.target.value})} className="w-full px-3 py-2 border border-slate-300 rounded-md shadow-sm focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none text-sm text-slate-900" placeholder="ชื่อบุคคล/คณะกรรมการ" />
+              </div>
+
+              <div>
+                <label className="block text-[13px] font-medium text-slate-700 mb-1">โครงการที่เกี่ยวข้อง</label>
+                <input type="text" value={formData.project} onChange={e => setFormData({...formData, project: e.target.value})} className="w-full px-3 py-2 border border-slate-300 rounded-md shadow-sm focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none text-sm text-slate-900" placeholder="ระบุชื่อโครงการ (ถ้ามี)" />
+              </div>
+
+              <div>
+                <label className="block text-[13px] font-medium text-slate-700 mb-1">งบประมาณ (บาท)</label>
+                <input type="number" value={formData.budget} onChange={e => setFormData({...formData, budget: e.target.value})} className="w-full px-3 py-2 border border-slate-300 rounded-md shadow-sm focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none text-sm text-slate-900" placeholder="0" />
+              </div>
+
+              <div>
+                <label className="block text-[13px] font-medium text-slate-700 mb-1">หน่วยงานที่ประสาน</label>
+                <input type="text" value={formData.coordinators} onChange={e => setFormData({...formData, coordinators: e.target.value})} className="w-full px-3 py-2 border border-slate-300 rounded-md shadow-sm focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none text-sm text-slate-900" placeholder="หน่วยงานภายใน/ภายนอก" />
+              </div>
+
+              <div className="md:col-span-2 pt-2 border-t border-slate-100">
+                <label className="block text-[13px] font-medium text-slate-700 mb-1">สถานะงาน</label>
+                <select value={formData.status} onChange={e => setFormData({...formData, status: e.target.value})} className="w-full md:w-1/2 px-3 py-2 border border-slate-300 rounded-md shadow-sm focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none bg-white text-sm text-slate-900">
+                  <option value="pending">รอดำเนินการ</option>
+                  <option value="in-progress">กำลังดำเนินการ</option>
+                  <option value="completed">เสร็จสิ้น</option>
+                </select>
+              </div>
+
+              {formData.status === 'completed' && (
+                <div className="md:col-span-2">
+                  <label className="block text-[13px] font-medium text-slate-700 mb-1">ลิงก์แนบไฟล์ผลงาน / รูปภาพ (URL)</label>
+                  <input type="url" value={formData.imageUrl} onChange={e => setFormData({...formData, imageUrl: e.target.value})} className="w-full px-3 py-2 border border-slate-300 rounded-md shadow-sm focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none text-sm text-slate-900" placeholder="https://drive.google.com/..." />
+                  <p className="text-[11px] text-slate-500 mt-1">วางลิงก์ Google Drive หรือแหล่งเก็บไฟล์อื่นๆ</p>
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end space-x-3 pt-4 mt-6 border-t border-slate-200">
+              <button type="button" onClick={handleCloseModal} className="px-4 py-2 text-sm text-slate-600 bg-white border border-slate-300 hover:bg-slate-50 font-medium rounded-md shadow-sm transition-colors">ยกเลิก</button>
+              <button type="submit" disabled={isSaving} className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-md shadow-sm transition-colors flex items-center">
+                {isSaving ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <CheckCircle className="w-4 h-4 mr-2" />}
+                {isSaving ? 'กำลังบันทึก...' : 'บันทึกข้อมูล'}
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    );
+  };
+
+  const renderDialog = () => {
+    if (!dialog.isOpen) return null;
+    return (
+      <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4 z-[60]">
+        <div className="bg-white rounded-lg shadow-xl w-full max-w-sm overflow-hidden border border-slate-200">
+          <div className="p-5">
+             <h3 className="text-base font-semibold text-slate-800 mb-2">
+              {dialog.type === 'confirm' ? 'ยืนยันการดำเนินการ' : 'แจ้งเตือน'}
+            </h3>
+            <p className="text-sm text-slate-600">{dialog.message}</p>
+          </div>
+          <div className="bg-slate-50 px-5 py-3 flex justify-end space-x-2 border-t border-slate-200">
+            {dialog.type === 'confirm' && (
+              <button onClick={closeDialog} className="px-3 py-1.5 text-sm text-slate-600 bg-white border border-slate-300 hover:bg-slate-50 font-medium rounded-md shadow-sm transition-colors">
+                ยกเลิก
+              </button>
+            )}
+            <button 
+              onClick={() => {
+                if (dialog.onConfirm) dialog.onConfirm();
+                closeDialog();
+              }} 
+              className={`px-3 py-1.5 text-sm font-medium rounded-md shadow-sm text-white transition-colors ${dialog.type === 'confirm' ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'}`}
+            >
+              ตกลง
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="flex min-h-screen bg-slate-50 font-sans">
+      {renderSidebar()}
+      
+      <main className="flex-1 overflow-x-hidden flex flex-col h-screen">
+        <header className="bg-white border-b border-slate-200 px-6 py-4 flex justify-between items-center z-10">
+          <div>
+            <h1 className="text-xl font-bold text-slate-800 tracking-tight">ระบบบริหารจัดการงาน กิจการนักเรียน</h1>
+            <p className="text-xs text-slate-500 mt-1">ติดตาม ตรวจสอบ และรายงานผลการดำเนินงาน</p>
+          </div>
+          <div className="flex items-center space-x-3">
+            <span className="text-xs font-semibold text-slate-600 bg-slate-100 px-3 py-1.5 rounded-md border border-slate-200">
+              ปีการศึกษา {currentMonth.getFullYear() + 543}
+            </span>
+          </div>
+        </header>
+
+        <div className="flex-1 overflow-y-auto p-6">
+          <div className="max-w-7xl mx-auto flex flex-col h-full gap-6">
+            {currentView === 'active' && (
+              <div className="w-full">
+                {renderMiniCalendar()}
+              </div>
+            )}
+            
+            <div className="flex-1 min-h-[400px]">
+              {renderTaskTable(currentView === 'completed')}
+            </div>
+          </div>
+        </div>
+      </main>
+
+      {renderTaskModal()}
+      {renderDialog()}
+    </div>
+  );
+}
